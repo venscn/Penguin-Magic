@@ -412,6 +412,7 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
   const rafRef = useRef<number | null>(null);
   const isDraggingRef = useRef(false);
   const isCanvasDraggingRef = useRef(false);
+  const draggingSelectionRef = useRef<Set<string>>(new Set()); // 存储拖动时的选择
   
   // 上次鼠标位置，用于计算画布平移时的增量
   const lastMousePosRef = useRef<Vec2>({ x: 0, y: 0 });
@@ -6232,28 +6233,29 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
           // 存储当前 delta
           dragDeltaRef.current = { x: deltaX, y: deltaY };
           
-          if (rafRef.current) cancelAnimationFrame(rafRef.current);
-          rafRef.current = requestAnimationFrame(() => {
-              const delta = dragDeltaRef.current;
-              
-              // 🔧 关键修复：使用函数式更新，避免覆盖并发添加的新节点
-              // 不在这里更新 nodesRef，让 useEffect 来同步
-              setNodes(prevNodes => {
-                  return prevNodes.map(node => {
-                      if (selectedNodeIds.has(node.id)) {
-                          const initialPos = initialNodePositionsRef.current.get(node.id);
-                          if (initialPos) {
-                              return {
-                                  ...node,
-                                  x: initialPos.x + delta.x,
-                                  y: initialPos.y + delta.y
-                              };
-                          }
-                      }
-                      return node;
-                  });
-              });
+          // 🔧 关键修复：移除动画效果，实时更新位置
+          const delta = dragDeltaRef.current;
+          
+          // 🔧 关键修复：使用 draggingSelectionRef.current 而不是 selectedNodeIds
+          // 避免 React 状态更新的异步问题
+          const updatedNodes = nodesRef.current.map(node => {
+              if (draggingSelectionRef.current.has(node.id)) {
+                  const initialPos = initialNodePositionsRef.current.get(node.id);
+                  if (initialPos) {
+                      return {
+                          ...node,
+                          x: initialPos.x + delta.x,
+                          y: initialPos.y + delta.y
+                      };
+                  }
+              }
+              return node;
           });
+          
+          // 🔧 关键修复：同时更新 ref 和状态，确保节点 UI 和连线都能实时更新
+          // 但要避免平滑动画效果，这已经通过移除 CSS transition 实现
+          nodesRef.current = updatedNodes;
+          setNodes(updatedNodes);
           return;
       }
 
@@ -6326,6 +6328,8 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
 
       // 拖拽结束后标记未保存
       if (wasDragging) {
+          // 🔧 关键修复：拖动结束时更新 React 状态，确保节点位置正确保存
+          setNodes(nodesRef.current);
           setHasUnsavedChanges(true);
           console.log('[拖拽] 拖拽结束，已标记未保存');
       }
@@ -6380,6 +6384,9 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
       setIsDragOperation(true);
       setDragStartMousePos({ x: e.clientX, y: e.clientY });
       dragStartMousePosRef.current = { x: e.clientX, y: e.clientY }; // 同步更新 ref
+      
+      // 🔧 关键修复：存储当前选择到 ref，避免异步状态问题
+      draggingSelectionRef.current = newSelection;
       
       // Snapshot positions - 使用 nodesRef 确保获取最新的节点位置
       const positions = new Map<string, Vec2>();
@@ -7835,7 +7842,12 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
                     }}
                     onDragStart={handleNodeDragStart}
                     onUpdate={updateNode}
-                    onDelete={(id) => setNodes(prev => prev.filter(n => n.id !== id))}
+                    onDelete={(id) => {
+                        // 删除节点
+                        setNodes(prev => prev.filter(n => n.id !== id));
+                        // 删除与该节点相关的所有连线
+                        setConnections(prev => prev.filter(conn => conn.fromNode !== id && conn.toNode !== id));
+                    }}
                     onExecute={handleExecuteNode}
                     onStop={handleStopNode}
                     onDownload={async (id) => {
