@@ -339,10 +339,29 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
   const lastSaveRef = useRef<{ nodes: string; connections: string; groups: string }>({ nodes: '', connections: '', groups: '' });
   const saveCanvasRef = useRef<(() => Promise<void>) | null>(null); // 用于避免循环依赖
 
+  // === 历史记录系统 ===
+  interface HistoryItem {
+    id: string;
+    type: string;
+    timestamp: number;
+    description: string;
+    details: string;
+    beforeState?: { nodes: CanvasNode[]; connections: Connection[]; groups: NodeGroup[] };
+    afterState?: { nodes: CanvasNode[]; connections: Connection[]; groups: NodeGroup[] };
+    nodeId?: string;
+  }
+
   // --- State ---
   const [showIntro, setShowIntro] = useState(false); // 禁用解锁动画
   const [nodes, setNodes] = useState<CanvasNode[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
+  
+  // --- History State ---
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  const [showHistoryPanel, setShowHistoryPanel] = useState<boolean>(false);
+  const [selectedHistoryItem, setSelectedHistoryItem] = useState<HistoryItem | null>(null);
+  const [isRestoringHistory, setIsRestoringHistory] = useState(false); // 防止历史恢复时触发新的历史记录
   
   // 自动保存状态（默认禁用，首次操作后启用）
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
@@ -395,6 +414,9 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
   const clipboardRef = useRef<CanvasNode[]>([]);
   const internalCopyTimeRef = useRef<number>(0); // 内部复制时间戳
   const systemClipboardSnapshotRef = useRef<number>(0); // 复制节点时系统剪贴板图片大小（指纹）
+  
+  // Resize 操作相关的临时状态存储
+  const resizeStartStateRef = useRef<any>(null);
 
   // Abort Controllers for cancelling operations
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
@@ -409,6 +431,9 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
   // 拖拽优化：使用 ref 存储实时偏移量，避免频繁 setState
   const dragDeltaRef = useRef<Vec2>({ x: 0, y: 0 });
   const canvasDragRef = useRef<Vec2>({ x: 0, y: 0 });
+  const hasNodeMovedRef = useRef(false); // 标记节点是否真的移动了
+  const dragStartNodePositionsRef = useRef<Map<string, Vec2>>(new Map()); // 拖拽开始时的节点位置
+  const dragStartHistoryStateRef = useRef<any>(null); // 拖拽开始时的完整历史状态
   const rafRef = useRef<number | null>(null);
   const isDraggingRef = useRef(false);
   const isCanvasDraggingRef = useRef(false);
@@ -743,6 +768,179 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
     }
     return null;
   }, [loadCanvasList, onCanvasCreated, currentCanvasId]);
+
+  // === 历史记录核心函数 ===
+  
+  // 添加历史记录
+  const addHistory = useCallback((type: string, description: string, details: string = '', nodeId?: string, manualBeforeState?: any) => {
+    if (isRestoringHistory) return;
+
+    const beforeState = manualBeforeState || {
+      nodes: JSON.parse(JSON.stringify(nodesRef.current)),
+      connections: JSON.parse(JSON.stringify(connectionsRef.current)),
+      groups: JSON.parse(JSON.stringify(groupsRef.current))
+    };
+
+    const newItem: HistoryItem = {
+      id: Math.random().toString(36).substr(2, 9),
+      type,
+      timestamp: Date.now(),
+      description,
+      details,
+      beforeState,
+      nodeId
+    };
+
+    // 如果当前不在历史记录末尾，截断后面的记录
+    const newHistory = history.slice(0, historyIndex + 1);
+    
+    // 检查是否可以合并前一条历史记录：如果是相同节点的 resize 操作
+    let canMerge = false;
+    if (type === 'resize_node' && nodeId && newHistory.length > 0) {
+      const lastItem = newHistory[newHistory.length - 1];
+      if (lastItem.type === 'resize_node' && lastItem.nodeId === nodeId) {
+        canMerge = true;
+      }
+    }
+    
+    if (canMerge) {
+      // 合并：更新最后一条历史记录的时间戳，但保持 beforeState 不变
+      const lastItem = newHistory[newHistory.length - 1];
+      newHistory[newHistory.length - 1] = {
+        ...lastItem,
+        timestamp: Date.now(),
+        description,
+        details
+      };
+      setHistory(newHistory);
+      // 不改变 historyIndex，因为我们只是更新了最后一条
+    } else {
+      // 正常添加新记录
+      newHistory.push(newItem);
+      
+      // 限制历史记录数量，最多保留 50 条
+      if (newHistory.length > 50) {
+        newHistory.shift();
+        setHistory(newHistory);
+        setHistoryIndex(49);
+      } else {
+        setHistory(newHistory);
+        setHistoryIndex(newHistory.length - 1);
+      }
+    }
+  }, [history, historyIndex, isRestoringHistory]);
+
+  // Resize 开始：保存状态
+  const onResizeStart = useCallback((nodeId: string) => {
+    if (isRestoringHistory) return;
+    resizeStartStateRef.current = {
+      nodes: JSON.parse(JSON.stringify(nodesRef.current)),
+      connections: JSON.parse(JSON.stringify(connectionsRef.current)),
+      groups: JSON.parse(JSON.stringify(groupsRef.current))
+    };
+  }, [isRestoringHistory]);
+
+  // Resize 结束：添加历史记录
+  const onResizeEnd = useCallback((nodeId: string, description: string) => {
+    if (isRestoringHistory || !resizeStartStateRef.current) return;
+    
+    addHistory('resize_node', description, `调整节点大小: ${nodeId.slice(0, 8)}`, nodeId, resizeStartStateRef.current);
+    
+    setTimeout(() => {
+      const updateHistoryAfterStateLocal = () => {
+        if (isRestoringHistory || historyIndex < 0) return;
+
+        setHistory(prev => {
+          const newHistory = [...prev];
+          if (newHistory[historyIndex]) {
+            newHistory[historyIndex] = {
+              ...newHistory[historyIndex],
+              afterState: {
+                nodes: JSON.parse(JSON.stringify(nodesRef.current)),
+                connections: JSON.parse(JSON.stringify(connectionsRef.current)),
+                groups: JSON.parse(JSON.stringify(groupsRef.current))
+              }
+            };
+          }
+          return newHistory;
+        });
+      };
+      updateHistoryAfterStateLocal();
+    }, 0);
+    
+    resizeStartStateRef.current = null;
+  }, [addHistory, historyIndex, isRestoringHistory]);
+
+  // 更新历史记录的 afterState（在操作完成后调用）
+  const updateHistoryAfterState = useCallback(() => {
+    if (isRestoringHistory || historyIndex < 0) return;
+
+    setHistory(prev => {
+      const newHistory = [...prev];
+      if (newHistory[historyIndex]) {
+        newHistory[historyIndex] = {
+          ...newHistory[historyIndex],
+          afterState: {
+            nodes: JSON.parse(JSON.stringify(nodesRef.current)),
+            connections: JSON.parse(JSON.stringify(connectionsRef.current)),
+            groups: JSON.parse(JSON.stringify(groupsRef.current))
+          }
+        };
+      }
+      return newHistory;
+    });
+  }, [historyIndex, isRestoringHistory]);
+
+  // 撤销
+  const undo = useCallback(() => {
+    if (historyIndex < 0 || !history[historyIndex]) return;
+
+    const item = history[historyIndex];
+    if (!item.beforeState) return;
+
+    setIsRestoringHistory(true);
+
+    const { nodes: prevNodes, connections: prevConns, groups: prevGroups } = item.beforeState;
+    
+    setNodes(prevNodes);
+    setConnections(prevConns);
+    setGroups(prevGroups);
+    
+    nodesRef.current = prevNodes;
+    connectionsRef.current = prevConns;
+    groupsRef.current = prevGroups;
+
+    setHistoryIndex(prev => prev - 1);
+    setHasUnsavedChanges(true);
+
+    setTimeout(() => setIsRestoringHistory(false), 100);
+  }, [history, historyIndex]);
+
+  // 重做
+  const redo = useCallback(() => {
+    if (historyIndex >= history.length - 1) return;
+
+    const nextIndex = historyIndex + 1;
+    const item = history[nextIndex];
+    if (!item.afterState) return;
+
+    setIsRestoringHistory(true);
+
+    const { nodes: nextNodes, connections: nextConns, groups: nextGroups } = item.afterState;
+    
+    setNodes(nextNodes);
+    setConnections(nextConns);
+    setGroups(nextGroups);
+    
+    nodesRef.current = nextNodes;
+    connectionsRef.current = nextConns;
+    groupsRef.current = nextGroups;
+
+    setHistoryIndex(nextIndex);
+    setHasUnsavedChanges(true);
+
+    setTimeout(() => setIsRestoringHistory(false), 100);
+  }, [history, historyIndex]);
 
   // 保存当前画布（防抖）- 会自动将图片内容本地化到画布专属文件夹
   const saveCurrentCanvas = useCallback(async () => {
@@ -1360,13 +1558,30 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
       // 1. Delete Nodes
       if (selectedNodeIds.size > 0) {
         const idsToDelete = new Set<string>(selectedNodeIds);
-          setNodes(prev => prev.filter(n => !idsToDelete.has(n.id)));
-          setConnections(prev => prev.filter(c => !idsToDelete.has(c.fromNode) && !idsToDelete.has(c.toNode)));
+        const deletedNodes = nodesRef.current.filter(n => idsToDelete.has(n.id));
+        const deletedNodeNames = deletedNodes.map(n => n.title || n.type).join(', ');
+        
+        // 添加历史记录
+        addHistory('delete_nodes', `删除${deletedNodes.length}个节点`, `删除节点: ${deletedNodeNames}`);
+        
+        // 执行删除
+        const newNodes = nodesRef.current.filter(n => !idsToDelete.has(n.id));
+        const newConns = connectionsRef.current.filter(c => !idsToDelete.has(c.fromNode) && !idsToDelete.has(c.toNode));
+        
+        setNodes(newNodes);
+        setConnections(newConns);
+        
+        // 更新 refs
+        nodesRef.current = newNodes;
+        connectionsRef.current = newConns;
           
           // 组现在是基于位置检测的，不需要同步更新 nodeIds
           
           setSelectedNodeIds(new Set<string>());
           setHasUnsavedChanges(true); // 标记未保存
+          
+          // 更新历史记录的 afterState
+          updateHistoryAfterState();
       }
       // 2. Delete Connection
       if (selectedConnectionId) {
@@ -1389,17 +1604,34 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
               }
           }
           
-          setConnections(prev => prev.filter(c => c.id !== selectedConnectionId));
+          const newConns = connectionsRef.current.filter(c => c.id !== selectedConnectionId);
+          setConnections(newConns);
+          connectionsRef.current = newConns;
+          
           setSelectedConnectionId(null);
           setHasUnsavedChanges(true); // 标记未保存
+          
+          // 更新历史记录的 afterState
+          updateHistoryAfterState();
       }
       // 3. 解散选中的组（Delete键解散组，不删除组内节点）
       if (selectedGroupId) {
-          setGroups(prev => prev.filter(g => g.id !== selectedGroupId));
+          const groupToDelete = groupsRef.current.find(g => g.id === selectedGroupId);
+          
+          // 添加历史记录
+          addHistory('delete_group', '解散组', groupToDelete ? `组: ${groupToDelete.name || '未命名组'}` : '');
+          
+          const newGroups = groupsRef.current.filter(g => g.id !== selectedGroupId);
+          setGroups(newGroups);
+          groupsRef.current = newGroups;
+          
           setSelectedGroupId(null);
           setHasUnsavedChanges(true);
+          
+          // 更新历史记录的 afterState
+          updateHistoryAfterState();
       }
-  }, [selectedNodeIds, selectedConnectionId, selectedGroupId]);
+  }, [selectedNodeIds, selectedConnectionId, selectedGroupId, addHistory, updateHistoryAfterState]);
 
   // === 节点编组操作 ===
   
@@ -2127,6 +2359,16 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
                   e.preventDefault();
                   setSelectedNodeIds(new Set(nodesRef.current.map(n => n.id)));
               }
+              if (e.key === 'z' && !e.shiftKey) {
+                  // Ctrl+Z 撤销
+                  e.preventDefault();
+                  undo();
+              }
+              if (e.key === 'z' && e.shiftKey) {
+                  // Ctrl+Shift+Z 重做
+                  e.preventDefault();
+                  redo();
+              }
           }
       };
       
@@ -2163,7 +2405,7 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
           window.removeEventListener('keyup', handleKeyUp);
           window.removeEventListener('sidebar-drag-end', handleSidebarDragEnd);
       };
-  }, [deleteSelection, handleCopy, handlePaste, canvasOffset, scale, isActive]);
+  }, [deleteSelection, handleCopy, handlePaste, canvasOffset, scale, isActive, undo, redo]);
 
   // Wheel event handler for zooming
   const onWheel = useCallback((e: WheelEvent) => {
@@ -2334,6 +2576,9 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
           y = spot.y;
       }
 
+      // 先添加历史记录（记录操作前状态）
+      addHistory('add_node', `添加${title || type}节点`, `节点类型: ${type}, 位置: (${Math.round(x)}, ${Math.round(y)})`);
+
       const newNode: CanvasNode = {
           id: uuid(),
           type,
@@ -2347,7 +2592,14 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
           status: 'idle'
       };
       setNodes(prev => [...prev, newNode]);
+      
+      // 立即更新 ref
+      nodesRef.current = [...nodesRef.current, newNode];
+      
       setHasUnsavedChanges(true); // 标记未保存
+      
+      // 更新历史记录的 afterState
+      updateHistoryAfterState();
       
       return newNode;
   };
@@ -2392,7 +2644,40 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
   }, [onPendingImageAdded]);
 
   // 🔧 修复竞态条件：使用函数式更新确保状态一致性
-  const updateNode = useCallback((id: string, updates: Partial<CanvasNode>) => {
+  const updateNode = useCallback((id: string, updates: Partial<CanvasNode>, skipHistoryForAutoResize?: boolean, forceAddResizeHistory?: boolean) => {
+      // 先找到要更新的节点，判断是否需要记录历史
+      const oldNode = nodesRef.current.find(n => n.id === id);
+      
+      // 判断是否是重要的内容变更（排除临时状态，如执行状态等）
+      const hasSignificantChange = oldNode && !skipHistoryForAutoResize && (
+          forceAddResizeHistory ||
+          ('content' in updates && updates.content !== oldNode.content) ||
+          ('title' in updates && updates.title !== oldNode.title) ||
+          ('data' in updates && JSON.stringify(updates.data) !== JSON.stringify(oldNode.data)) ||
+          ('width' in updates && updates.width !== oldNode.width) ||
+          ('height' in updates && updates.height !== oldNode.height)
+      );
+      
+      // 如果是重要变更，先添加历史记录
+      if (hasSignificantChange) {
+          let historyType = 'update_node';
+          let historyDesc = `修改${oldNode?.title || oldNode?.type || '节点'}`;
+          
+          // 判断是否是尺寸变更
+          if (forceAddResizeHistory || (('width' in updates || 'height' in updates) && 
+              !('content' in updates) && !('title' in updates) && !('data' in updates))) {
+              historyType = 'resize_node';
+              historyDesc = `调整${oldNode?.title || oldNode?.type || '节点'}大小`;
+          }
+          
+          addHistory(
+            historyType, 
+            historyDesc,
+            `修改节点: ${oldNode?.title || oldNode?.type || id.slice(0, 8)}`,
+            historyType === 'resize_node' ? id : undefined
+          );
+      }
+      
       // 先同步更新 ref，确保级联执行时能立即获取最新状态
       nodesRef.current = nodesRef.current.map(n => 
           n.id === id ? { ...n, ...updates } : n
@@ -2402,7 +2687,12 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
       setNodes(prev => prev.map(n => 
           n.id === id ? { ...n, ...updates } : n
       ));
-  }, []);
+      
+      // 如果是重要变更，更新历史记录的 afterState
+      if (hasSignificantChange) {
+          updateHistoryAfterState();
+      }
+  }, [addHistory, updateHistoryAfterState]);
 
   // 辅助函数：更新节点内容并根据图片实际尺寸调整节点尺寸
   const updateNodeWithImageSize = useCallback((nodeId: string, imageUrl: string, status: 'completed' | 'error') => {
@@ -6256,6 +6546,11 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
           // 但要避免平滑动画效果，这已经通过移除 CSS transition 实现
           nodesRef.current = updatedNodes;
           setNodes(updatedNodes);
+          
+          // 标记节点已移动
+          if (!hasNodeMovedRef.current) {
+              hasNodeMovedRef.current = true;
+          }
           return;
       }
 
@@ -6332,6 +6627,42 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
           setNodes(nodesRef.current);
           setHasUnsavedChanges(true);
           console.log('[拖拽] 拖拽结束，已标记未保存');
+          
+          // 只有真正移动了节点才添加历史记录
+          if (hasNodeMovedRef.current && dragStartHistoryStateRef.current) {
+              const dragCount = draggingSelectionRef.current.size;
+              const currentNodes = nodesRef.current;
+              const firstNode = currentNodes.find(n => draggingSelectionRef.current.has(n.id));
+              
+              // 手动创建历史记录项，使用开始时保存的 beforeState
+              const beforeState = dragStartHistoryStateRef.current;
+              const newItem: HistoryItem = {
+                id: Math.random().toString(36).substr(2, 9),
+                type: 'move_nodes',
+                timestamp: Date.now(),
+                description: dragCount > 1 ? `移动${dragCount}个节点` : `移动${firstNode?.title || firstNode?.type || '节点'}`,
+                details: dragCount > 1 ? `移动 ${dragCount} 个节点` : `移动节点: ${firstNode?.title || firstNode?.type}`,
+                beforeState,
+                afterState: {
+                  nodes: JSON.parse(JSON.stringify(nodesRef.current)),
+                  connections: JSON.parse(JSON.stringify(connectionsRef.current)),
+                  groups: JSON.parse(JSON.stringify(groupsRef.current))
+                }
+              };
+              
+              // 插入历史记录
+              const newHistory = history.slice(0, historyIndex + 1);
+              newHistory.push(newItem);
+              
+              if (newHistory.length > 50) {
+                newHistory.shift();
+                setHistory(newHistory);
+                setHistoryIndex(49);
+              } else {
+                setHistory(newHistory);
+                setHistoryIndex(newHistory.length - 1);
+              }
+          }
       }
 
       // Resolve Selection Box
@@ -6398,6 +6729,15 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
       });
       setInitialNodePositions(positions);
       initialNodePositionsRef.current = positions; // 同步更新 ref
+      
+      // 保存拖拽开始时的完整状态和节点位置，并重置移动标志
+      dragStartHistoryStateRef.current = {
+        nodes: JSON.parse(JSON.stringify(nodesRef.current)),
+        connections: JSON.parse(JSON.stringify(connectionsRef.current)),
+        groups: JSON.parse(JSON.stringify(groupsRef.current))
+      };
+      dragStartNodePositionsRef.current = new Map(positions);
+      hasNodeMovedRef.current = false;
   };
 
   const handleStartConnection = (nodeId: string, portType: 'in' | 'out', pos: Vec2) => {
@@ -6416,6 +6756,13 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
           const sourceNodeId = linkingState.fromNode;
           const targetNode = nodes.find(n => n.id === targetNodeId);
           const sourceNode = nodes.find(n => n.id === sourceNodeId);
+          
+          // 添加历史记录
+          addHistory(
+            'add_connection', 
+            `创建连线`, 
+            `从 ${sourceNode?.title || sourceNode?.type || sourceNodeId.slice(0, 8)} 到 ${targetNode?.title || targetNode?.type || targetNodeId.slice(0, 8)}`
+          );
           
           // 检查是否连接到 rh-config 节点的参数端口
           if (targetNode?.type === 'rh-config' && portKey && sourceNode) {
@@ -6484,6 +6831,9 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
               setHasUnsavedChanges(true);
               console.log('[Connection] 连接已创建（即时反馈）');
           }
+          
+          // 更新历史记录的 afterState
+          updateHistoryAfterState();
       }
   };
 
@@ -7330,6 +7680,138 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
           导入组
         </button>
         
+        {/* 历史记录按钮 */}
+        <div className="relative">
+          <button
+            onClick={() => setShowHistoryPanel(!showHistoryPanel)}
+            className={`w-8 h-8 flex items-center justify-center rounded-lg transition-all ${
+              showHistoryPanel 
+                ? 'bg-orange-500 hover:bg-orange-600 text-white shadow-lg' 
+                : 'bg-gray-700/50 hover:bg-gray-600/70 text-gray-300'
+            }`}
+            style={{
+              backdropFilter: 'blur(8px)',
+              border: '1px solid rgba(255,255,255,0.1)',
+            }}
+            title="历史记录 (Ctrl+Z / Ctrl+Shift+Z)"
+          >
+            📜
+          </button>
+          
+          {/* 历史记录气泡框 */}
+          {showHistoryPanel && (
+            <div 
+              className="absolute top-full right-0 mt-2 z-50 w-96 rounded-xl shadow-2xl overflow-hidden"
+              style={{
+                backgroundColor: 'rgba(20, 20, 25, 0.95)',
+                backdropFilter: 'blur(16px)',
+                border: '1px solid rgba(255,255,255,0.1)',
+                boxShadow: '0 10px 30px rgba(0, 0, 0, 0.5)',
+              }}
+            >
+              {/* 标题栏 */}
+              <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
+                <span className="text-sm font-bold text-white">历史记录</span>
+                <div className="flex items-center gap-2">
+                  <button 
+                    onClick={undo}
+                    disabled={historyIndex < 0}
+                    className={`w-7 h-7 rounded-lg flex items-center justify-center transition-all ${
+                      historyIndex < 0 
+                        ? 'bg-gray-800/50 text-gray-600 cursor-not-allowed' 
+                        : 'bg-gray-700/50 hover:bg-orange-600 text-gray-300 hover:text-white'
+                    }`}
+                    title="撤销 (Ctrl+Z)"
+                  >
+                    ↶
+                  </button>
+                  <button 
+                    onClick={redo}
+                    disabled={historyIndex >= history.length - 1}
+                    className={`w-7 h-7 rounded-lg flex items-center justify-center transition-all ${
+                      historyIndex >= history.length - 1 
+                        ? 'bg-gray-800/50 text-gray-600 cursor-not-allowed' 
+                        : 'bg-gray-700/50 hover:bg-orange-600 text-gray-300 hover:text-white'
+                    }`}
+                    title="重做 (Ctrl+Shift+Z)"
+                  >
+                    ↷
+                  </button>
+                  <button 
+                    onClick={() => setShowHistoryPanel(false)}
+                    className="w-7 h-7 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+              
+              {/* 历史记录列表 */}
+              <div className="max-h-80 overflow-y-auto">
+                {history.length === 0 ? (
+                  <div className="p-8 text-center text-gray-500 text-sm">
+                    暂无历史记录
+                  </div>
+                ) : (
+                  history.map((item, index) => (
+                    <div 
+                      key={item.id}
+                      className={`px-4 py-2.5 cursor-pointer transition-all ${
+                        index <= historyIndex 
+                          ? 'bg-orange-500/15 text-orange-300 border-l-2 border-orange-500' 
+                          : 'text-gray-400 hover:bg-white/5'
+                      }`}
+                      onMouseEnter={() => setSelectedHistoryItem(item)}
+                      onMouseLeave={() => setSelectedHistoryItem(null)}
+                      onClick={() => {
+                        // 点击时跳转到该历史记录
+                        if (index < historyIndex) {
+                          // 需要撤销
+                          for (let i = 0; i < historyIndex - index; i++) {
+                            undo();
+                          }
+                        } else if (index > historyIndex) {
+                          // 需要重做
+                          for (let i = 0; i < index - historyIndex; i++) {
+                            redo();
+                          }
+                        }
+                      }}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs opacity-70">
+                            {new Date(item.timestamp).toLocaleTimeString()}
+                          </span>
+                          <span className="font-medium text-sm">
+                            {item.description}
+                          </span>
+                        </div>
+                        {index <= historyIndex && (
+                          <span className="text-xs text-orange-400">●</span>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+              
+              {/* 详情展示区域 */}
+              {selectedHistoryItem && (
+                <div className="px-4 py-3 border-t border-white/10 bg-black/20">
+                  <div className="text-xs text-gray-400 mb-1">操作详情</div>
+                  <div className="text-sm text-gray-300">
+                    {selectedHistoryItem.details}
+                  </div>
+                  <div className="mt-2 text-xs text-gray-500">
+                    类型: {selectedHistoryItem.type} | ID: {selectedHistoryItem.id}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        
         {/* 帮助按钮 */}
         <button
           onClick={() => setShowHelpPanel(!showHelpPanel)}
@@ -7842,6 +8324,8 @@ const PebblingCanvas: React.FC<PebblingCanvasProps> = ({
                     }}
                     onDragStart={handleNodeDragStart}
                     onUpdate={updateNode}
+                    onResizeStart={onResizeStart}
+                    onResizeEnd={onResizeEnd}
                     onDelete={(id) => {
                         // 删除节点
                         setNodes(prev => prev.filter(n => n.id !== id));

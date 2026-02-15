@@ -116,7 +116,9 @@ interface CanvasNodeProps {
   isSelected: boolean;
   isLightCanvas?: boolean; // 画布浅色主题
   onSelect: (id: string, multi: boolean) => void;
-  onUpdate: (id: string, updates: Partial<CanvasNode>) => void;
+  onUpdate: (id: string, updates: Partial<CanvasNode>, skipHistory?: boolean, forceAddResizeHistory?: boolean) => void;
+  onResizeStart?: (nodeId: string) => void;
+  onResizeEnd?: (nodeId: string, description: string) => void;
   onDelete: (id: string) => void;
   onExecute: (id: string, count?: number) => void; // count: 批量生成数量
   onStop: (id: string) => void;
@@ -145,6 +147,8 @@ const CanvasNodeItem: React.FC<CanvasNodeProps> = ({
   isLightCanvas = false,
   onSelect, 
   onUpdate,
+  onResizeStart,
+  onResizeEnd,
   onDelete,
   onExecute,
   onStop,
@@ -379,19 +383,37 @@ const CanvasNodeItem: React.FC<CanvasNodeProps> = ({
     const startWidth = node.width;
     const startHeight = node.height;
 
+    let hasResized = false;
+    
+    if (onResizeStart) {
+        onResizeStart(node.id);
+    }
+    
     const handleMouseMove = (moveEvent: MouseEvent) => {
         const deltaX = (moveEvent.clientX - startX) / scale;
         const deltaY = (moveEvent.clientY - startY) / scale;
+        const newWidth = Math.max(150, startWidth + deltaX);
+        const newHeight = Math.max(100, startHeight + deltaY);
+        
+        if (newWidth !== startWidth || newHeight !== startHeight) {
+            hasResized = true;
+        }
+        
         onUpdate(node.id, {
-            width: Math.max(150, startWidth + deltaX),
-            height: Math.max(100, startHeight + deltaY)
-        });
+            width: newWidth,
+            height: newHeight
+        }, true);
     };
 
     const handleMouseUp = () => {
         setIsResizing(false);
         document.removeEventListener('mousemove', handleMouseMove);
         document.removeEventListener('mouseup', handleMouseUp);
+        
+        if (hasResized && onResizeEnd) {
+            const historyDesc = `调整${node?.title || node?.type || '节点'}大小`;
+            onResizeEnd(node.id, historyDesc);
+        }
     };
 
     document.addEventListener('mousemove', handleMouseMove);
